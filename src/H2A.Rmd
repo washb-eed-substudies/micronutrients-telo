@@ -1,0 +1,485 @@
+---
+title: "H2A_Final"
+
+We create cumulative micronutrient burden group variables and examine associations to telomere length at 28 months. 
+The function "fit_RE_GLM" is used to model a GLM for each exposure and outcome pair. Covariate pre-screening and selection is built into the model code. 
+
+The data was subseted to only the variables utilized for code optimization and reduce run-time. 
+---
+Downloading packages, getting data frame, and 0 function
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(washbgam)
+library(washb)
+library(devtools)
+library(here)
+library(ggplot2)
+library(here)
+install.packages("car")
+library(car)
+
+
+setwd("/Users/sumuccu/Micronutrient-Telomere")
+
+
+rm(list=ls())
+
+source(here("0-config.R"))
+
+d <- read.csv("/Users/sumuccu/Desktop/bangladesh-merged-eed-mn-data.csv")
+
+```
+
+Assembling cumulaitve burden score variables
+
+We created four different burden scores
+
+- All micronutrients 
+- Non-Iron (ex. Vitamin A, vitamin B, and vitamin B12 ONLY)
+- B Vitamins
+- Vitamin A and Iron Deficiency Anemia 
+
+We added a sensitivity analysis that utilized a missingness component (i.e. model will allow one missing domain). 
+
+We also created a secondary analysis that compares 1 and 2+ micronutrient deficiencies to telomere length. 
+
+
+```{r}
+
+d <- d %>%
+  select(lowfer, lowfer_inf, highsTFR, iron_def, irondef_inf , irondefanemia, irondefanemia_inf, vit_A_def, B12def, folatedef, delta_TS_Z,     
+         logFER_inf, hemo_eeel, hepcidin_eeel,
+         logsTFR_inf, logRBP_inf, logB12, logfolate, clusterid, TS_t3_Z, sex, age, 
+         birthord, momage, momheight, momedu, hfiacat, Nlt18, Ncomp, watmin, walls, floor, HHwealth_scaled, tr, 
+         life_viol_any_t3_cat, viol_any_preg_cat, sumscore_t0_mom_Z)
+
+# Restrict H2A analyses to the telomere-available analytic sample.
+d <- d %>%
+  filter(!is.na(TS_t3_Z))
+
+make_def_count <- function(dat, vars, min_nonmissing = length(vars)) {
+  observed_n <- rowSums(!is.na(dat[, vars]))
+  score <- rowSums(dat[, vars], na.rm = TRUE)
+  score[observed_n < min_nonmissing] <- NA_real_
+  score
+}
+
+summarize_burden_levels <- function(dat, score_var, max_domains, label, outcome_var = "TS_t3_Z") {
+  score_sym <- rlang::sym(score_var)
+  outcome_sym <- rlang::sym(outcome_var)
+
+  dat %>%
+    filter(!is.na(!!score_sym)) %>%
+    count(level = !!score_sym, name = "n") %>%
+    complete(level = 0:max_domains, fill = list(n = 0)) %>%
+    mutate(
+      composite = label,
+      total_n = sum(n),
+      percent = 100 * n / total_n
+    ) %>%
+    rowwise() %>%
+    mutate(
+      level_label = paste0(level, ifelse(level == 1, " deficiency", " deficiencies")),
+      prop_ci = list(stats::binom.test(n, total_n)$conf.int),
+      percent_lb = 100 * prop_ci[[1]][1],
+      percent_ub = 100 * prop_ci[[1]][2],
+      n_with_outcome = sum(!is.na(dat[[score_var]]) & dat[[score_var]] == level & !is.na(dat[[outcome_var]]))
+    ) %>%
+    ungroup() %>%
+    select(composite, level, level_label, n, total_n, percent, percent_lb, percent_ub, n_with_outcome)
+}
+
+# Primary burden score:
+# one non-overlapping micronutrient deficiency count per domain
+# iron is represented once using the inflammation-adjusted iron deficiency indicator
+d$mm_domain_primary <- make_def_count(
+  d,
+  vars = c("irondef_inf", "vit_A_def", "B12def", "folatedef")
+)
+
+# Sensitivity:
+# same primary burden score, but allow one missing domain
+d$mm_domain_primary_relaxed <- make_def_count(
+  d,
+  vars = c("irondef_inf", "vit_A_def", "B12def", "folatedef"),
+  min_nonmissing = 3
+)
+
+# Sensitivity 1:
+# non-iron burden only
+d$mm_noiron <- make_def_count(
+  d,
+  vars = c("vit_A_def", "B12def", "folatedef")
+)
+
+# Sensitivity 2:
+# B-vitamin burden only
+d$mm_bdef <- make_def_count(
+  d,
+  vars = c("B12def", "folatedef")
+)
+
+# Sensitivity 3:
+# focused anemia and vitamin A burden
+d$mm_aanemia <- make_def_count(
+  d,
+  vars = c("vit_A_def", "irondefanemia_inf")
+)
+
+# Descriptive categorical version of the primary score
+d$mm_domain_primary_cat <- case_when(
+  is.na(d$mm_domain_primary) ~ NA_character_,
+  d$mm_domain_primary == 0 ~ "0 deficiencies",
+  d$mm_domain_primary == 1 ~ "1 deficiency",
+  d$mm_domain_primary >= 2 ~ "2+ deficiencies"
+)
+
+d$mm_domain_primary_cat <- factor(
+  d$mm_domain_primary_cat,
+  levels = c("0 deficiencies", "1 deficiency", "2+ deficiencies")
+)
+
+fit_categorical_glm <- function(d, Y, cat_var, W = NULL) {
+  contrast_specs <- list(
+    list(
+      new_var = "mm_primary_1_vs_0",
+      label = "1 deficiency",
+      keep_levels = c("0 deficiencies", "1 deficiency")
+    ),
+    list(
+      new_var = "mm_primary_2plus_vs_0",
+      label = "2+ deficiencies",
+      keep_levels = c("0 deficiencies", "2+ deficiencies")
+    )
+  )
+
+  contrast_res <- lapply(contrast_specs, function(spec) {
+    dat_sub <- d %>%
+      filter(.data[[cat_var]] %in% spec$keep_levels | is.na(.data[[cat_var]])) %>%
+      mutate(
+        !!spec$new_var := case_when(
+          .data[[cat_var]] == spec$keep_levels[1] ~ 0,
+          .data[[cat_var]] == spec$keep_levels[2] ~ 1,
+          TRUE ~ NA_real_
+        )
+      )
+
+    fit_res <- fit_washb_glm(
+      d = dat_sub,
+      Y = Y,
+      X = spec$new_var,
+      W = W,
+      print = FALSE
+    )
+
+    fit_res %>%
+      mutate(
+        category = spec$label,
+        Y = Y
+      ) %>%
+      select(category, Y, N, coef, se, zval, pval, lb, ub)
+  })
+
+  bind_rows(contrast_res)
+}
+
+```
+
+running models
+
+```{r}
+Xvars <- c("mm_domain_primary", "mm_domain_primary_relaxed", "mm_noiron", "mm_bdef", "mm_aanemia")       
+
+Yvars <- c("TS_t3_Z")
+
+#Set list of adjustment variables
+
+Wvars <- c(
+  "sex", "age", "birthord", "momage", "momheight", "momedu",
+  "hfiacat", "Nlt18", "Ncomp", "watmin", "walls", "floor", "HHwealth_scaled",
+  "tr", "life_viol_any_t3_cat", "viol_any_preg_cat")
+
+figure_names_h2a <- c(
+  mm_domain_primary = "Micronutrient domain burden score",
+  mm_domain_primary_relaxed = "Missing-data sensitivity score",
+  mm_noiron = "Non-iron deficiency burden",
+  mm_bdef = "B-vitamin deficiency burden",
+  mm_aanemia = "Vitamin A and iron deficiency anemia burden",
+  TS_t3_Z = "Telomere length z-score"
+)
+
+res_unadj <- NULL
+for(i in Xvars){
+  for(j in Yvars){
+    print(i)
+    temp <- fit_washb_glm(d=d, Y=j, X=i, W=NULL)
+    temp$X <- i
+    temp$Y <- j
+    print(temp)
+    res_unadj <- bind_rows(res_unadj, temp)
+  }}
+
+res_adj <- NULL
+for(i in Xvars){
+  for(j in Yvars){
+    print(i)
+    temp <- fit_washb_glm(d=d, Y=j, X=i, W=Wvars)
+    temp$X <- i
+    temp$Y <- j
+    print(temp)
+    res_adj <- bind_rows(res_adj, temp)
+  }}
+
+res_unadj_plot <- res_unadj %>%
+  mutate(
+    X = ifelse(X %in% names(figure_names_h2a), figure_names_h2a[X], X),
+    Y = ifelse(Y %in% names(figure_names_h2a), figure_names_h2a[Y], Y)
+  )
+
+res_adj_plot <- res_adj %>%
+  mutate(
+    X = ifelse(X %in% names(figure_names_h2a), figure_names_h2a[X], X),
+    Y = ifelse(Y %in% names(figure_names_h2a), figure_names_h2a[Y], Y)
+  )
+
+res_adj_main_plot <- res_adj_plot %>%
+  filter(X != figure_names_h2a["mm_domain_primary_relaxed"])
+
+p_h2a_main_domains <- ggplot(res_adj_main_plot, (aes(x=X, y=coef))) +
+  geom_point(size=3, color = analysis_palette["primary"]) +
+  geom_errorbar(aes(ymin=lb, ymax=ub), width = 0.75, linewidth = 1, color = analysis_palette["primary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  facet_wrap(~Y, ncol=2, scales="free") +
+  coord_flip() +
+  labs(
+    title = "Main analysis",
+    y = "Adjusted mean difference in telomere length z-score",
+    x = NULL
+  ) +
+  theme_analysis_plot() +
+  theme(axis.ticks.x=element_blank(),
+        legend.position = "none",
+        strip.text = element_text(vjust=1),
+        axis.text.y=ggtext::element_markdown(),
+        panel.spacing = unit(1, "lines"))
+
+primary_cat_table <- d %>%
+  filter(!is.na(mm_domain_primary_cat), !is.na(TS_t3_Z)) %>%
+  group_by(mm_domain_primary_cat) %>%
+  summarise(
+    n = n(),
+    mean_telomere_z = mean(TS_t3_Z, na.rm = TRUE),
+    sd_telomere_z = sd(TS_t3_Z, na.rm = TRUE),
+    se_telomere_z = sd_telomere_z / sqrt(n),
+    mean_lb = mean_telomere_z - 1.96 * se_telomere_z,
+    mean_ub = mean_telomere_z + 1.96 * se_telomere_z,
+    .groups = "drop"
+  )
+
+burden_level_table <- bind_rows(
+  summarize_burden_levels(
+    dat = d,
+    score_var = "mm_domain_primary",
+    max_domains = 4,
+    label = "Micronutrient domain burden score"
+  ),
+  summarize_burden_levels(
+    dat = d,
+    score_var = "mm_domain_primary_relaxed",
+    max_domains = 4,
+    label = "Missing-data sensitivity score"
+  ),
+  summarize_burden_levels(
+    dat = d,
+    score_var = "mm_noiron",
+    max_domains = 3,
+    label = "Non-iron deficiency burden"
+  ),
+  summarize_burden_levels(
+    dat = d,
+    score_var = "mm_bdef",
+    max_domains = 2,
+    label = "B-vitamin deficiency burden"
+  ),
+  summarize_burden_levels(
+    dat = d,
+    score_var = "mm_aanemia",
+    max_domains = 2,
+    label = "Vitamin A and iron deficiency anemia burden"
+  )
+)
+
+burden_level_plot_data <- burden_level_table %>%
+  mutate(
+    composite = factor(
+      composite,
+      levels = c(
+        "Micronutrient domain burden score",
+        "Missing-data sensitivity score",
+        "Non-iron deficiency burden",
+        "B-vitamin deficiency burden",
+        "Vitamin A and iron deficiency anemia burden"
+      )
+    ),
+    level_label = factor(
+      level_label,
+      levels = c(
+        "0 deficiencies",
+        "1 deficiency",
+        "2 deficiencies",
+        "3 deficiencies",
+        "4 deficiencies"
+      )
+    )
+  )
+
+p_h2a_burden_levels <- ggplot(
+  burden_level_plot_data,
+  aes(x = level_label, y = percent)
+) +
+  geom_col(
+    fill = analysis_palette["fill"],
+    color = analysis_palette["primary"],
+    linewidth = 0.6
+  ) +
+  geom_errorbar(
+    aes(ymin = percent_lb, ymax = percent_ub),
+    width = 0.18,
+    linewidth = 0.8,
+    color = analysis_palette["primary"]
+  ) +
+  facet_wrap(~composite, scales = "free_x", ncol = 2) +
+  theme_analysis_plot() +
+  labs(
+    title = "Distribution of deficiency levels within each burden score",
+    x = "Number of deficient micronutrient domains",
+    y = "Children in category (%)"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    strip.text = element_text(hjust = 0)
+  )
+
+for (score_name in unique(as.character(burden_level_plot_data$composite))) {
+  plot_dat <- burden_level_plot_data %>%
+    filter(as.character(composite) == score_name)
+
+  p_single_burden <- ggplot(
+    plot_dat,
+    aes(x = level_label, y = percent)
+  ) +
+    geom_col(
+      fill = analysis_palette["fill"],
+      color = analysis_palette["primary"],
+      linewidth = 0.6
+    ) +
+    geom_errorbar(
+      aes(ymin = percent_lb, ymax = percent_ub),
+      width = 0.18,
+      linewidth = 0.8,
+      color = analysis_palette["primary"]
+    ) +
+    theme_analysis_plot() +
+    labs(
+      title = score_name,
+      x = "Number of deficient micronutrient domains",
+      y = "Children in category (%)"
+    ) +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 0, hjust = 0.5)
+    )
+
+  safe_name <- gsub("[^A-Za-z0-9]+", "_", score_name)
+  safe_name <- gsub("^_|_$", "", safe_name)
+
+  ggsave(
+    here("results", paste0("H2A_burden_levels_", safe_name, ".png")),
+    p_single_burden,
+    width = 6,
+    height = 4,
+    dpi = 600
+  )
+}
+
+primary_cat_res <- fit_categorical_glm(
+  d = d,
+  Y = "TS_t3_Z",
+  cat_var = "mm_domain_primary_cat",
+  W = Wvars
+) %>%
+  mutate(
+    category = factor(category, levels = c("1 deficiency", "2+ deficiencies")),
+    Y_label = figure_names_h2a["TS_t3_Z"]
+  )
+
+p_h2a_main <- ggplot(primary_cat_res, aes(x = category, y = coef)) +
+  geom_errorbar(
+    aes(ymin = lb, ymax = ub),
+    width = 0.12,
+    linewidth = 1,
+    color = analysis_palette["primary"]
+  ) +
+  geom_point(
+    size = 3.5,
+    color = analysis_palette["primary"]
+  ) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  theme_analysis_plot() +
+  labs(
+    title = "Preliminary analysis",
+    subtitle = "Reference: no deficient micronutrient domains",
+    x = "Number of deficient micronutrient domains",
+    y = "Adjusted mean difference in telomere length z-score"
+  ) +
+  theme(legend.position = "none")
+
+primary_missingness_sensitivity <- res_adj %>%
+  filter(X %in% c("mm_domain_primary", "mm_domain_primary_relaxed")) %>%
+  mutate(
+    analysis = c("Complete-domain primary score", "Relaxed missing-data primary score"),
+    analysis = factor(
+      analysis,
+      levels = c("Complete-domain primary score", "Relaxed missing-data primary score")
+    )
+  ) %>%
+  select(analysis, N, coef, se, zval, pval, lb, ub, X, Y)
+
+p_h2a_missingness <- ggplot(primary_missingness_sensitivity, aes(x = analysis, y = coef)) +
+  geom_point(size = 3, color = analysis_palette["secondary"]) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.15, linewidth = 1, color = analysis_palette["secondary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  coord_flip() +
+  theme_analysis_plot() +
+  labs(
+    title = "Sensitivity analysis",
+    x = NULL,
+    y = "Adjusted mean difference in telomere length z-score"
+  ) +
+  theme(legend.position = "none")
+
+
+
+write.csv(res_unadj, here("results/H2Aunadj_results.csv"))
+write.csv(res_adj, here("results/H2Aadj_results.csv"))
+write.csv(primary_cat_table, here("results/H2A_primary_burden_categories.csv"), row.names = FALSE)
+write.csv(primary_cat_res, here("results/H2A_primary_categorical_model.csv"), row.names = FALSE)
+write.csv(primary_missingness_sensitivity, here("results/H2A_missingness_sensitivity.csv"), row.names = FALSE)
+write.csv(burden_level_table, here("results/H2A_burden_level_distribution.csv"), row.names = FALSE)
+
+
+ggsave(here("results/H2A_main_categorical_burden_plot.png"), p_h2a_main, width=6, height=5, dpi=600)
+ggsave(here("results/H2A_sensitivity_panel.png"), p_h2a_main_domains, width=7, height=5, dpi=600)
+ggsave(here("results/H2A_missingness_sensitivity_plot.png"), p_h2a_missingness, width=6, height=4, dpi=600)
+ggsave(here("results/H2A_burden_level_distribution_plot.png"), p_h2a_burden_levels, width=10, height=7, dpi=600)
+
+primary_cat_table
+primary_cat_res
+primary_missingness_sensitivity
+burden_level_table
+p_h2a_burden_levels
+
+```

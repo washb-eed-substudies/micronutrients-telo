@@ -1,0 +1,230 @@
+---
+title: "H2B_Final"
+
+In this file we run a fischers-exact test to determine co-deificency prevalance within the cohort at age 28 months. 
+
+Chatgpt (Codex) version 26.7 was utlized to generate 2x2 table code. 
+
+Table plot is generated at the end of the document. 
+---
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(washbgam)
+library(washb)
+library(devtools)
+library(here)
+library(ggplot2)
+library(here)
+install.packages("car")
+library(car)
+
+
+setwd("/Users/sumuccu/Micronutrient-Telomere")
+
+
+rm(list=ls())
+
+source(here("0-config.R"))
+
+d <- read.csv("/Users/sumuccu/Desktop/bangladesh-merged-eed-mn-data.csv")
+
+
+d <- d %>%
+  select(lowfer, lowfer_inf, highsTFR, iron_def, irondef_inf , irondefanemia, irondefanemia_inf, vit_A_def, B12def, folatedef, delta_TS_Z,     
+         logFER_inf, hemo_eeel, hepcidin_eeel,
+         logsTFR_inf, logRBP_inf, logB12, logfolate, clusterid, TS_t3_Z, sex, age, 
+         birthord, momage, momheight, momedu, hfiacat, Nlt18, Ncomp, watmin, walls, floor, HHwealth_scaled, tr, 
+         life_viol_any_t3_cat, viol_any_preg_cat, sumscore_t0_mom_Z)
+
+# Restrict H2B co-deficiency analyses to the telomere-available analytic sample.
+d <- d %>%
+  filter(!is.na(TS_t3_Z))
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(here)
+
+dir.create(here("results", "H2B"), recursive = TRUE, showWarnings = FALSE)
+
+validate_binary_deficiency <- function(x, var_name) {
+  observed <- sort(unique(stats::na.omit(x)))
+  if (length(observed) == 0 || !all(observed %in% c(0, 1))) {
+    stop(
+      paste0(
+        "Variable ", var_name, " is not coded as binary 0/1. Observed values: ",
+        paste(observed, collapse = ", ")
+      )
+    )
+  }
+  
+  as.integer(x)
+}
+
+# --------------------------
+# Choose binary deficiency variables
+# --------------------------
+pair_list <- list(
+  c("lowfer_inf", "vit_A_def"),
+  c("highsTFR", "vit_A_def"),
+  c("irondefanemia_inf", "vit_A_def"),
+  c("lowfer_inf", "B12def"),
+  c("highsTFR", "B12def"),
+  c("lowfer_inf", "folatedef"),
+  c("highsTFR", "folatedef"),
+  c("vit_A_def", "B12def"),
+  c("vit_A_def", "folatedef"),
+  c("B12def", "folatedef")
+)
+
+# --------------------------
+# Figure-ready names
+# --------------------------
+figure_names_pairs <- c(
+  lowfer_inf = "Low ferritin",
+  highsTFR = "High sTfR",
+  irondefanemia_inf = "Iron deficiency anemia",
+  vit_A_def = "Vitamin A deficiency",
+  B12def = "Vitamin B12 deficiency",
+  folatedef = "Folate deficiency"
+)
+
+# --------------------------
+# Check variables exist
+# --------------------------
+pair_vars <- unique(unlist(pair_list))
+missing_vars <- setdiff(pair_vars, colnames(d))
+
+if(length(missing_vars) > 0){
+  stop(paste("These variables are missing from d:", paste(missing_vars, collapse = ", ")))
+}
+
+# --------------------------
+# Fisher test + prevalence table
+# --------------------------
+pair_prev_test_res <- NULL
+
+for (k in seq_along(pair_list)) {
+  
+  v1 <- pair_list[[k]][1]
+  v2 <- pair_list[[k]][2]
+  
+  d_sub <- d %>%
+    select(all_of(c(v1, v2))) %>%
+    filter(!is.na(.data[[v1]]), !is.na(.data[[v2]]))
+  
+  x <- validate_binary_deficiency(d_sub[[v1]], v1)
+  y <- validate_binary_deficiency(d_sub[[v2]], v2)
+  
+  # 2x2 table
+  tab <- table(
+    factor(x, levels = c(0, 1)),
+    factor(y, levels = c(0, 1))
+  )
+  
+  # Fisher's exact test
+  ft <- fisher.test(tab)
+  
+  # Counts
+  n00 <- tab[1, 1]
+  n01 <- tab[1, 2]
+  n10 <- tab[2, 1]
+  n11 <- tab[2, 2]
+  
+  n_complete <- sum(tab)
+  n_def1 <- n10 + n11
+  n_def2 <- n01 + n11
+  n_both <- n11
+  
+  prev_def1 <- n_def1 / n_complete
+  prev_def2 <- n_def2 / n_complete
+  prev_both <- n_both / n_complete
+  expected_both_indep <- prev_def1 * prev_def2
+  obs_exp_ratio <- ifelse(expected_both_indep > 0, prev_both / expected_both_indep, NA_real_)
+  
+  res <- data.frame(
+    def1 = v1,
+    def2 = v2,
+    pair_label = paste0(unname(figure_names_pairs[v1]), " + ", unname(figure_names_pairs[v2])),
+    n_complete = n_complete,
+    n_ts_complete = nrow(d),
+    n00 = n00,
+    n01 = n01,
+    n10 = n10,
+    n11 = n11,
+    n_def1 = n_def1,
+    n_def2 = n_def2,
+    n_both = n_both,
+    prev_def1 = prev_def1,
+    prev_def2 = prev_def2,
+    prev_both = prev_both,
+    expected_both_indep = expected_both_indep,
+    obs_exp_ratio = obs_exp_ratio,
+    odds_ratio = unname(ft$estimate),
+    or_lb = ft$conf.int[1],
+    or_ub = ft$conf.int[2],
+    p_value = ft$p.value
+  )
+  
+  pair_prev_test_res <- bind_rows(pair_prev_test_res, res)
+}
+
+# Optional multiple-testing correction
+pair_prev_test_res <- pair_prev_test_res %>%
+  mutate(
+    p_fdr = p.adjust(p_value, method = "fdr"),
+    sig_raw = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      TRUE ~ ""
+    ),
+    sig_fdr = case_when(
+      p_fdr < 0.001 ~ "***",
+      p_fdr < 0.01  ~ "**",
+      p_fdr < 0.05  ~ "*",
+      TRUE ~ ""
+    ),
+    sig_plot = case_when(
+      sig_fdr != "" ~ paste0(sig_fdr, " FDR"),
+      sig_raw != "" ~ paste0(sig_raw, " raw"),
+      TRUE ~ ""
+    )
+  ) %>%
+  arrange(desc(prev_both))
+
+pair_prev_test_res
+
+write.csv(pair_prev_test_res, here("results", "H2B", "H2B_pair_prevalence_fisher.csv"), row.names = FALSE)
+```
+```{r}
+p_pair_prev <- ggplot(pair_prev_test_res, aes(x = pair_label, y = prev_both)) +
+  geom_col(fill = analysis_palette["primary"], alpha = 0.9) +
+  geom_text(aes(label = paste0("n=", n_both)),
+            hjust = -0.15, size = 3, color = analysis_palette["neutral"]) +
+  geom_text(aes(y = prev_both + 0.002, label = sig_plot),
+            hjust = 0, size = 3.5, color = analysis_palette["secondary"]) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) paste0(round(x * 100, 1), "%"),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    x = "Co-deficiency pair",
+    y = "Co-deficiency prevalence",
+    title = "Co-deficiency prevalence by micronutrient pair",
+    subtitle = "Restricted to children with non-missing telomere length z-score"
+  ) +
+  theme_analysis_plot() +
+  theme(legend.position = "none")
+
+ggsave(here("results", "H2B", "H2B_pair_prevalence_barplot.png"),
+       p_pair_prev, width = 8, height = 5, dpi = 600)
+
+print(p_pair_prev)
+```

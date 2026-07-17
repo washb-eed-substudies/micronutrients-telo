@@ -1,0 +1,551 @@
+---
+title: "H1B_Final"
+
+We utilize binary micronutrient deficiency variables and examine associations to telomere length at 28 months. 
+The function "fit_RE_GLM" is used to model a GLM for each exposure and outcome pair. Covariate pre-screening and selection is built into the model code. 
+
+The data was subseted to only the variables utilized for code optimization and reduce run-time. 
+---
+
+```{r}
+  library(dplyr)
+  library(tidyr)
+  library(washbgam)
+  library(washb)
+  library(devtools)
+  library(here)
+  library(ggplot2)
+  
+  install.packages("car")
+  library(car)
+  
+  
+  setwd("/Users/sumuccu/Micronutrient-Telomere")
+  
+  rm(list=ls())
+  
+  source(here("0-config.R"))
+  
+  d <- read.csv("/Users/sumuccu/Desktop/bangladesh-merged-eed-mn-data.csv")
+  
+  #glm function
+  fit_RE_glm <- function (d, Y, X, W = NULL, forcedW = NULL, V = NULL, id = "clusterid", family = "gaussian", pval = 0.2, print = TRUE){
+    
+    cat("\nNon-prescreened covariates: ", paste(forcedW, 
+                                                sep = "", collapse = ", "), "\n")
+    set.seed(12345)
+    require(mgcv)
+    require(dplyr)
+    require(faraway)
+    if (!is.null(V)) {
+      require(lmtest)
+    }
+    if (!is.null(W)) {
+      W <- subset(d, select = W)
+    }
+    Y <- subset(d, select = Y)
+    colnames(Y) <- "Y"
+    X <- subset(d, select = X)
+    colnames(X) <- "X"
+    id <- subset(d, select = id)
+    colnames(id) <- "id"
+    if (!is.null(V)) {
+      Vvar <- subset(d, select = V)
+      colnames(Vvar) <- "V"
+    }
+    else {
+      Vvar <- data.frame(V = rep(1, nrow(d)))
+    }
+    collinear_vars <- NULL
+    if (!is.null(W)) {
+      gamdat <- data.frame(Y, X, id, Vvar, W)
+    }
+    else {
+      gamdat <- data.frame(Y, X, id, Vvar)
+    }
+    if (!is.null(W)) {
+      if (sum(is.na(forcedW)) != 0) {
+        colnamesW <- names(W)
+      }
+      else {
+        if (is.null(forcedW)) {
+          Wnames <- names(W)
+          forcedW <- c(Wnames[Wnames == "tr" | grepl("age_", 
+                                                     Wnames) | grepl("agedays_", Wnames) | 
+                                grepl("ageday_", Wnames)])
+        }
+        cat("\nNon-prescreened covariates: ", paste(forcedW, 
+                                                    sep = "", collapse = ", "), "\n")
+        colnamesW <- names(W)[!(names(W) %in% forcedW)]
+      }
+      screenW <- subset(gamdat, select = colnamesW)
+    }
+    else {
+      screenW <- NULL
+    }
+    if (!is.null(screenW)) {
+      if (print == TRUE) {
+        cat("\n-----------------------------------------\nPre-screening the adjustment covariates:\n-----------------------------------------\n")
+      }
+      suppressWarnings(Wscreen <- washb_prescreen(Y = gamdat$Y, 
+                                                  Ws = screenW, family = family, pval = pval, print = print))
+      if (!is.null(forcedW)) {
+        Wscreen <- c(as.character(Wscreen), as.character(forcedW))
+      }
+      W <- subset(gamdat, select = Wscreen)
+      Wdf <- W
+      Wdf$constant <- rep(1, nrow(gamdat))
+      for (i in 1:ncol(W)) {
+        tmp <- glm(constant ~ ., data = Wdf, family = family)
+        todrop <- NULL
+        todrop <- try(suppressWarnings(names(tmp$coefficients)[-1][as.vector(vif(tmp)) > 10][1]))
+        if (!is.null(todrop) & !is.na(todrop)) {
+          collinear_vars <- c(collinear_vars, todrop)
+          Wdf <- Wdf[, colnames(Wdf) != todrop]
+        }
+      }
+      to_keep <- colnames(W)[!(colnames(W) %in% collinear_vars)]
+      if (length(to_keep) != length(colnames(W))) {
+        cat("\nDropped for collinearity with other covariates:\n", 
+            colnames(W)[!(colnames(W) %in% to_keep)])
+      }
+      W_processed <- W[which(colnames(W) %in% to_keep)]
+      Wscreen <- colnames(W_processed)
+      cat("\n\nCovariated included in model:\n", Wscreen)
+    }
+    else {
+      Wscreen = NULL
+    }
+    if (!is.null(Wscreen)) {
+      d <- subset(gamdat, select = c("Y", "X", 
+                                     "id", "V", Wscreen))
+    }
+    else {
+      d <- subset(gamdat, select = c("Y", "X", 
+                                     "id", "V"))
+    }
+    fullrows <- nrow(d)
+    d <- d %>% filter(!is.na(Y))
+    Yrows <- nrow(d)
+    cat("\nRows dropped due to missing outcome: ", fullrows - 
+          Yrows, "\n")
+    d <- d %>% filter(!is.na(X))
+    Xrows <- nrow(d)
+    cat("Rows dropped due to missing exposure: ", Yrows - 
+          Xrows, "\n")
+    if (!is.null(W) & length(Wscreen) > 0) {
+      cat("Percent missingness by covariate:\n")
+      print(sapply(d[, -c(1:3)], function(x) round(sum(is.na(x))/nrow(X) * 
+                                                     100, 1)))
+      d <- d[complete.cases(d), ]
+      cat("\nRows dropped due to missing covariates: ", 
+          Xrows - nrow(d), "\n")
+    }
+    cat("Final sample size: ", nrow(d), "\n")
+    d$dummy <- 1
+    if (!is.null(W) & length(Wscreen) > 0) {
+      Ws <- subset(gamdat, select = c(Wscreen))
+      W_factors <- colnames(Ws)[(grepl("factor", sapply(Ws, 
+                                                        class)) | grepl("character", sapply(Ws, class)))]
+      W_numeric <- colnames(Ws)[(grepl("integer", sapply(Ws, 
+                                                         class)) | grepl("numeric", sapply(Ws, class)))]
+      indicator_vec <- rep(TRUE, length(W_numeric))
+      for (i in 1:length(W_numeric)) {
+        N_unique <- length(unique(Ws[, W_numeric[i]]))
+        if (N_unique > 20) {
+          indicator_vec[i] <- FALSE
+        }
+      }
+      W_indicator <- W_numeric[indicator_vec]
+      W_continious <- W_numeric[!indicator_vec]
+      if (length(W_continious) > 0) {
+        eq_num <- paste0(W_continious, 
+                         collapse = " + ")
+      }
+      else {
+        eq_num = NULL
+      }
+      if (length(W_factors) + length(W_indicator) > 0) {
+        eq_fact <- paste0(" + ", paste0(c(W_factors, 
+                                          W_indicator), collapse = " + "))
+      }
+      else {
+        eq_fact = NULL
+      }
+      if (length(unique(d$X)) > 2) {
+        if (!is.null(V)) {
+          form <- paste0("Y~X + V + X*V+", 
+                         eq_fact, " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form <- gsub("+ +", "+", form, fixed = TRUE)
+          equation <- as.formula(form)
+          form_null <- paste0("Y~X + V + ", 
+                              eq_fact, " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form_null <- gsub("+ +", "+", form_null, 
+                            fixed = TRUE)
+          equation_null <- as.formula(form_null)
+        }
+        else {
+          form <- paste0("Y~X+", eq_fact, 
+                         " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form <- gsub("+ +", "+", form, fixed = TRUE)
+          equation <- as.formula(form)
+        }
+      }
+      else {
+        if (!is.null(V)) {
+          form <- paste0("Y~X+ V + X*V +", eq_fact, 
+                         " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form <- gsub("+ +", "+", form, fixed = TRUE)
+          equation <- as.formula(form)
+          form_null <- paste0("Y~X+ V + ", eq_fact, 
+                              " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form_null <- gsub("+ +", "+", form_null, 
+                            fixed = TRUE)
+          equation_null <- as.formula(form_null)
+        }
+        else {
+          form <- paste0("Y~X+", eq_fact, " +", 
+                         eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form <- gsub("+ +", "+", form, fixed = TRUE)
+          equation <- as.formula(form)
+        }
+      }
+      fit <- mgcv::gam(formula = equation, data = d)
+      if (!is.null(V)) {
+        fit_null <- mgcv::gam(formula = equation_null, data = d)
+        LRp <- lrtest(fit, fit_null)[2, 5]
+      }
+    }
+    else {
+      if (length(unique(d$X)) > 2) {
+        if (!is.null(V)) {
+          equation <- as.formula(paste0("Y~X + V + X*V + s(id,bs=\"re\",by=dummy)"))
+          fit <- mgcv::gam(formula = equation, data = d)
+          equation_null <- as.formula(paste0("Y~X + V + s(id,bs=\"re\",by=dummy)"))
+          fit_null <- mgcv::gam(formula = equation_null, 
+                                data = d)
+          LRp <- lrtest(fit, fit_null)[2, 5]
+        }
+        else {
+          fit <- mgcv::gam(Y ~ s(X, bs = "cr") + 
+                             s(id, bs = "re", by = dummy), data = d)
+        }
+      }
+      else {
+        if (!is.null(V)) {
+          equation <- as.formula(paste0("Y~X + V + X*V + s(id,bs=\"re\",by=dummy)"))
+          fit <- mgcv::gam(formula = equation, data = d)
+          equation_null <- as.formula(paste0("Y~X + V + s(id,bs=\"re\",by=dummy)"))
+          fit_null <- mgcv::gam(formula = equation_null, 
+                                data = d)
+          LRp <- lrtest(fit, fit_null)[2, 5]
+        }
+        else {
+          fit <- mgcv::gam(Y ~ X + s(id, bs = "re", 
+                                     by = dummy), data = d)
+        }
+      }
+    }
+    if (!is.null(V)) {
+      cat("\nInteraction p-value: ", LRp, "\n")
+      return(list(fit = fit, dat = d, int.p = LRp, covars = Wscreen, 
+                  collinear_vars = collinear_vars))
+    }
+    else {
+      return(list(fit = fit, dat = d, covars = Wscreen, collinear_vars = collinear_vars))
+    }
+  }
+  
+  predict_glm_diff <- function(fit, d, quantile_diff = c(0.25, 0.75), Xvar, Yvar, binaryX = FALSE){
+    
+    res <- summary(fit)
+    res <- res$p.table[2,]
+    res <- data.frame(t(res))
+    
+  lb.diff <- res$Estimate - 1.96 * res$Std..Error
+  ub.diff <- res$Estimate + 1.96 * res$Std..Error
+  res <- data.frame(Y = Yvar, X = Xvar, N = nrow(d), q1 = NA, 
+                    q3 = NA, pred.q1 = NA, pred.q3 = NA, 
+                    point.diff=res$Estimate, lb.diff = lb.diff, ub.diff = ub.diff, Pval = res$Pr...t..)
+  
+  return(list(res = res))
+}
+
+fit_full_lm <- function(d, Y, X, W = NULL) {
+  model_vars <- c(Y, X, W)
+  dat <- d %>%
+    select(all_of(model_vars)) %>%
+    filter(complete.cases(.)) %>%
+    rename(Y = all_of(Y), X = all_of(X))
+  
+  rhs <- c("X", W)
+  form <- as.formula(paste("Y ~", paste(rhs, collapse = " + ")))
+  fit <- lm(form, data = dat)
+  fit_summary <- summary(fit)$coefficients["X", ]
+  
+  data.frame(
+    sensitivity_model = "Full adjustment, no prescreen",
+    X = X,
+    Y = Y,
+    N = nrow(dat),
+    coef = unname(fit_summary["Estimate"]),
+    se = unname(fit_summary["Std. Error"]),
+    statistic = unname(fit_summary["t value"]),
+    pval = unname(fit_summary["Pr(>|t|)"]),
+    lb = unname(fit_summary["Estimate"] - 1.96 * fit_summary["Std. Error"]),
+    ub = unname(fit_summary["Estimate"] + 1.96 * fit_summary["Std. Error"])
+  )
+}
+
+fit_full_re_model <- function(d, Y, X, W = NULL, id = "clusterid") {
+  model_vars <- c(Y, X, id, W)
+  dat <- d %>%
+    select(all_of(model_vars)) %>%
+    filter(complete.cases(.)) %>%
+    rename(Y = all_of(Y), X = all_of(X), id = all_of(id))
+  
+  dat$id <- as.factor(dat$id)
+  rhs <- c("X", W, "s(id, bs = \"re\")")
+  form <- as.formula(paste("Y ~", paste(rhs, collapse = " + ")))
+  fit <- mgcv::gam(form, data = dat, method = "REML")
+  fit_summary <- summary(fit)$p.table["X", ]
+  
+  data.frame(
+    sensitivity_model = "Full adjustment + cluster random effect",
+    X = X,
+    Y = Y,
+    N = nrow(dat),
+    coef = unname(fit_summary["Estimate"]),
+    se = unname(fit_summary["Std. Error"]),
+    statistic = unname(fit_summary["t value"]),
+    pval = unname(fit_summary["Pr(>|t|)"]),
+    lb = unname(fit_summary["Estimate"] - 1.96 * fit_summary["Std. Error"]),
+    ub = unname(fit_summary["Estimate"] + 1.96 * fit_summary["Std. Error"])
+  )
+}
+  
+```
+
+Analysis + Plotting Code 
+
+```{r}
+# subset data to only what is needed
+d <- d %>%
+  select(
+    logFER_inf, hemo_eeel, hepcidin_eeel, logsTFR_inf, logRBP_inf, logB12, logfolate,
+    clusterid, TS_t3_Z, sex, age, birthord, momage, momheight, momedu, hfiacat,
+    Nlt18, Ncomp, watmin, walls, floor, HHwealth_scaled, tr,
+    life_viol_any_t3_cat, viol_any_preg_cat,
+    lowfer_inf, highsTFR, irondefanemia_inf, vitadef_inf, folatedef, B12def, B12marg
+  )
+
+Xvars <- c(
+  "lowfer_inf", "highsTFR", "irondefanemia_inf",
+  "vitadef_inf", "folatedef", "B12def", "B12marg"
+)
+
+Yvars <- "TS_t3_Z"
+
+# Set list of adjustment variables
+Wvars <- c(
+  "sex", "age", "birthord", "momage", "momheight", "momedu",
+  "hfiacat", "Nlt18", "Ncomp", "watmin",
+  "HHwealth_scaled", "tr", "life_viol_any_t3_cat", "viol_any_preg_cat"
+)
+
+# Figure-ready names
+figure_names_h1b <- c(
+  lowfer_inf = "Low ferritin",
+  highsTFR = "High sTfR",
+  irondefanemia_inf = "Iron deficiency anemia",
+  vitadef_inf = "Vitamin A deficiency",
+  folatedef = "Folate deficiency",
+  B12def = "Vitamin B12 deficiency",
+  B12marg = "Marginal vitamin B12",
+  TS_t3_Z = "Telomere length z-score"
+)
+
+# --------------------------
+# Run unadjusted models
+# --------------------------
+h1bres_unadj <- NULL
+for(i in Xvars){
+  for(j in Yvars){
+    print(i)
+    temp <- fit_washb_glm(d = d, Y = j, X = i, W = NULL)
+    temp$X <- i
+    temp$Y <- j
+    print(temp)
+    h1bres_unadj <- bind_rows(h1bres_unadj, temp)
+  }
+}
+
+# --------------------------
+# Run adjusted models
+# --------------------------
+h1bres_adj <- NULL
+for(i in Xvars){
+  for(j in Yvars){
+    print(i)
+    temp <- fit_washb_glm(d = d, Y = j, X = i, W = Wvars)
+    temp$X <- i
+    temp$Y <- j
+    print(temp)
+    h1bres_adj <- bind_rows(h1bres_adj, temp)
+  }
+}
+
+# --------------------------
+# Make plotting copies with figure-ready names
+# --------------------------
+h1bres_unadj_plot <- h1bres_unadj %>%
+  mutate(
+    X = ifelse(X %in% names(figure_names_h1b), figure_names_h1b[X], X),
+    Y = ifelse(Y %in% names(figure_names_h1b), figure_names_h1b[Y], Y)
+  )
+
+h1bres_adj_plot <- h1bres_adj %>%
+  mutate(
+    X = ifelse(X %in% names(figure_names_h1b), figure_names_h1b[X], X),
+    Y = ifelse(Y %in% names(figure_names_h1b), figure_names_h1b[Y], Y)
+  )
+
+# --------------------------
+# Forest plots
+# --------------------------
+p_unadj <- ggplot(h1bres_unadj_plot, aes(x = X, y = coef)) +
+  geom_point(size = 3, color = analysis_palette["primary"]) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.75, linewidth = 1, color = analysis_palette["primary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  facet_wrap(~Y, ncol = 2, scales = "free") +
+  coord_flip() +
+  labs(y = "Mean difference", x = "Micronutrient deficiency indicators") +
+  ggtitle("") +
+  theme_analysis_plot() +
+  theme(
+    axis.ticks.x = element_blank(),
+    legend.position = "none",
+    strip.text = element_text(vjust = 1),
+    axis.text.y = ggtext::element_markdown(),
+    panel.spacing = unit(1, "lines")
+  )
+
+p_adj <- ggplot(h1bres_adj_plot, aes(x = X, y = coef)) +
+  geom_point(size = 3, color = analysis_palette["primary"]) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.75, linewidth = 1, color = analysis_palette["primary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  facet_wrap(~Y, ncol = 2, scales = "free") +
+  coord_flip() +
+  labs(y = "Adjusted mean difference", x = "Micronutrient deficiency indicators") +
+  ggtitle("") +
+  theme_analysis_plot() +
+  theme(
+    axis.ticks.x = element_blank(),
+    legend.position = "none",
+    strip.text = element_text(vjust = 1),
+    axis.text.y = ggtext::element_markdown(),
+    panel.spacing = unit(1, "lines")
+  )
+
+write.csv(h1bres_unadj, here("results/h1bunadj_results.csv"))
+write.csv(h1bres_adj, here("results/h1badj_results.csv"))
+
+ggsave(here("results/h1b_forest_plot_unadj.png"), p_unadj, width = 5, height = 5, dpi = 300)
+ggsave(here("results/h1b_forest_plot_adj.png"), p_adj, width = 5, height = 5, dpi = 300)
+
+```
+
+```{r}
+# H1B sensitivity analyses:
+# 1. Full prespecified adjustment set without prescreening
+# 2. Full prespecified adjustment set with cluster random effect
+
+dir.create(here("results", "H1B"), recursive = TRUE, showWarnings = FALSE)
+
+h1b_sensitivity_full_lm <- NULL
+h1b_sensitivity_re <- NULL
+
+for (i in Xvars) {
+  for (j in Yvars) {
+    full_lm_res <- fit_full_lm(d = d, Y = j, X = i, W = Wvars)
+    full_re_res <- fit_full_re_model(d = d, Y = j, X = i, W = Wvars)
+
+    h1b_sensitivity_full_lm <- bind_rows(h1b_sensitivity_full_lm, full_lm_res)
+    h1b_sensitivity_re <- bind_rows(h1b_sensitivity_re, full_re_res)
+  }
+}
+
+h1b_sensitivity_full_lm <- h1b_sensitivity_full_lm %>%
+  mutate(
+    X_label = ifelse(X %in% names(figure_names_h1b), figure_names_h1b[X], X),
+    Y_label = ifelse(Y %in% names(figure_names_h1b), figure_names_h1b[Y], Y)
+  ) %>%
+  select(sensitivity_model, X, X_label, Y, Y_label, N, coef, se, statistic, pval, lb, ub)
+
+h1b_sensitivity_re <- h1b_sensitivity_re %>%
+  mutate(
+    X_label = ifelse(X %in% names(figure_names_h1b), figure_names_h1b[X], X),
+    Y_label = ifelse(Y %in% names(figure_names_h1b), figure_names_h1b[Y], Y)
+  ) %>%
+  select(sensitivity_model, X, X_label, Y, Y_label, N, coef, se, statistic, pval, lb, ub)
+
+write.csv(
+  h1b_sensitivity_full_lm,
+  here("results", "H1B", "H1B_sensitivity_full_adjustment.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  h1b_sensitivity_re,
+  here("results", "H1B", "H1B_sensitivity_cluster_random_effect.csv"),
+  row.names = FALSE
+)
+
+p_h1b_full_lm <- ggplot(h1b_sensitivity_full_lm, aes(x = X_label, y = coef)) +
+  geom_point(size = 3, color = analysis_palette["primary"]) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.5, linewidth = 0.9, color = analysis_palette["primary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~Y_label, ncol = 1, scales = "free_y") +
+  theme_analysis_plot() +
+  labs(
+    title = "H1B sensitivity: full adjustment, no prescreen",
+    x = "Micronutrient deficiency indicators",
+    y = "Mean difference"
+  ) +
+  theme(legend.position = "none")
+
+p_h1b_re <- ggplot(h1b_sensitivity_re, aes(x = X_label, y = coef)) +
+  geom_point(size = 3, color = analysis_palette["secondary"]) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.5, linewidth = 0.9, color = analysis_palette["secondary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  coord_flip() +
+  facet_wrap(~Y_label, ncol = 1, scales = "free_y") +
+  theme_analysis_plot() +
+  labs(
+    title = "H1B sensitivity: full adjustment + cluster random effect",
+    x = "Micronutrient deficiency indicators",
+    y = "Mean difference"
+  ) +
+  theme(legend.position = "none")
+
+ggsave(
+  here("results", "H1B", "H1B_sensitivity_full_adjustment.png"),
+  p_h1b_full_lm,
+  width = 7,
+  height = 5,
+  dpi = 600
+)
+
+ggsave(
+  here("results", "H1B", "H1B_sensitivity_cluster_random_effect.png"),
+  p_h1b_re,
+  width = 7,
+  height = 5,
+  dpi = 600
+)
+
+h1b_sensitivity_full_lm
+h1b_sensitivity_re
+
+```

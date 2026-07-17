@@ -1,0 +1,800 @@
+---
+title: "H1A Final"
+
+We utilize continous micronutrient status variables and examine associations to telomere length at 28 months. 
+The function "fit_RE_GLM" is used to model a GLM for each exposure and outcome pair. Covariate pre-screening and selection is built into the model code. 
+
+The data was subseted to only the variables utilized for code optimization and reduce run-time. 
+---
+
+```{r}
+  library(dplyr)
+  library(tidyr)
+  library(washbgam)
+  library(washb)
+  library(devtools)
+  library(here)
+  library(ggplot2)
+  
+  install.packages("car")
+  library(car)
+  
+  
+  setwd("/Users/sumuccu/Micronutrient-Telomere")
+  
+  rm(list=ls())
+  
+  source(here("0-config.R"))
+  
+  d <- read.csv("/Users/sumuccu/Desktop/bangladesh-merged-eed-mn-data.csv")
+  
+  #glm function
+  fit_RE_glm <- function (d, Y, X, W = NULL, forcedW = NULL, V = NULL, id = "clusterid", family = "gaussian", pval = 0.2, print = TRUE){
+    
+    cat("\nNon-prescreened covariates: ", paste(forcedW, 
+                                                sep = "", collapse = ", "), "\n")
+    set.seed(12345)
+    require(mgcv)
+    require(dplyr)
+    require(faraway)
+    if (!is.null(V)) {
+      require(lmtest)
+    }
+    if (!is.null(W)) {
+      W <- subset(d, select = W)
+    }
+    Y <- subset(d, select = Y)
+    colnames(Y) <- "Y"
+    X <- subset(d, select = X)
+    colnames(X) <- "X"
+    id <- subset(d, select = id)
+    colnames(id) <- "id"
+    if (!is.null(V)) {
+      Vvar <- subset(d, select = V)
+      colnames(Vvar) <- "V"
+    }
+    else {
+      Vvar <- data.frame(V = rep(1, nrow(d)))
+    }
+    collinear_vars <- NULL
+    if (!is.null(W)) {
+      gamdat <- data.frame(Y, X, id, Vvar, W)
+    }
+    else {
+      gamdat <- data.frame(Y, X, id, Vvar)
+    }
+    if (!is.null(W)) {
+      if (sum(is.na(forcedW)) != 0) {
+        colnamesW <- names(W)
+      }
+      else {
+        if (is.null(forcedW)) {
+          Wnames <- names(W)
+          forcedW <- c(Wnames[Wnames == "tr" | grepl("age_", 
+                                                     Wnames) | grepl("agedays_", Wnames) | 
+                                grepl("ageday_", Wnames)])
+        }
+        cat("\nNon-prescreened covariates: ", paste(forcedW, 
+                                                    sep = "", collapse = ", "), "\n")
+        colnamesW <- names(W)[!(names(W) %in% forcedW)]
+      }
+      screenW <- subset(gamdat, select = colnamesW)
+    }
+    else {
+      screenW <- NULL
+    }
+    if (!is.null(screenW)) {
+      if (print == TRUE) {
+        cat("\n-----------------------------------------\nPre-screening the adjustment covariates:\n-----------------------------------------\n")
+      }
+      suppressWarnings(Wscreen <- washb_prescreen(Y = gamdat$Y, 
+                                                  Ws = screenW, family = family, pval = pval, print = print))
+      if (!is.null(forcedW)) {
+        Wscreen <- c(as.character(Wscreen), as.character(forcedW))
+      }
+      W <- subset(gamdat, select = Wscreen)
+      Wdf <- W
+      Wdf$constant <- rep(1, nrow(gamdat))
+      for (i in 1:ncol(W)) {
+        tmp <- glm(constant ~ ., data = Wdf, family = family)
+        todrop <- NULL
+        todrop <- try(suppressWarnings(names(tmp$coefficients)[-1][as.vector(vif(tmp)) > 10][1]))
+        if (!is.null(todrop) & !is.na(todrop)) {
+          collinear_vars <- c(collinear_vars, todrop)
+          Wdf <- Wdf[, colnames(Wdf) != todrop]
+        }
+      }
+      to_keep <- colnames(W)[!(colnames(W) %in% collinear_vars)]
+      if (length(to_keep) != length(colnames(W))) {
+        cat("\nDropped for collinearity with other covariates:\n", 
+            colnames(W)[!(colnames(W) %in% to_keep)])
+      }
+      W_processed <- W[which(colnames(W) %in% to_keep)]
+      Wscreen <- colnames(W_processed)
+      cat("\n\nCovariated included in model:\n", Wscreen)
+    }
+    else {
+      Wscreen = NULL
+    }
+    if (!is.null(Wscreen)) {
+      d <- subset(gamdat, select = c("Y", "X", 
+                                     "id", "V", Wscreen))
+    }
+    else {
+      d <- subset(gamdat, select = c("Y", "X", 
+                                     "id", "V"))
+    }
+    fullrows <- nrow(d)
+    d <- d %>% filter(!is.na(Y))
+    Yrows <- nrow(d)
+    cat("\nRows dropped due to missing outcome: ", fullrows - 
+          Yrows, "\n")
+    d <- d %>% filter(!is.na(X))
+    Xrows <- nrow(d)
+    cat("Rows dropped due to missing exposure: ", Yrows - 
+          Xrows, "\n")
+    if (!is.null(W) & length(Wscreen) > 0) {
+      cat("Percent missingness by covariate:\n")
+      print(sapply(d[, -c(1:3)], function(x) round(sum(is.na(x))/nrow(X) * 
+                                                     100, 1)))
+      d <- d[complete.cases(d), ]
+      cat("\nRows dropped due to missing covariates: ", 
+          Xrows - nrow(d), "\n")
+    }
+    cat("Final sample size: ", nrow(d), "\n")
+    d$dummy <- 1
+    if (!is.null(W) & length(Wscreen) > 0) {
+      Ws <- subset(gamdat, select = c(Wscreen))
+      W_factors <- colnames(Ws)[(grepl("factor", sapply(Ws, 
+                                                        class)) | grepl("character", sapply(Ws, class)))]
+      W_numeric <- colnames(Ws)[(grepl("integer", sapply(Ws, 
+                                                         class)) | grepl("numeric", sapply(Ws, class)))]
+      indicator_vec <- rep(TRUE, length(W_numeric))
+      for (i in 1:length(W_numeric)) {
+        N_unique <- length(unique(Ws[, W_numeric[i]]))
+        if (N_unique > 20) {
+          indicator_vec[i] <- FALSE
+        }
+      }
+      W_indicator <- W_numeric[indicator_vec]
+      W_continious <- W_numeric[!indicator_vec]
+      if (length(W_continious) > 0) {
+        eq_num <- paste0(W_continious, 
+                         collapse = " + ")
+      }
+      else {
+        eq_num = NULL
+      }
+      if (length(W_factors) + length(W_indicator) > 0) {
+        eq_fact <- paste0(" + ", paste0(c(W_factors, 
+                                          W_indicator), collapse = " + "))
+      }
+      else {
+        eq_fact = NULL
+      }
+      if (length(unique(d$X)) > 2) {
+        if (!is.null(V)) {
+          form <- paste0("Y~X + V + X*V+", 
+                         eq_fact, " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form <- gsub("+ +", "+", form, fixed = TRUE)
+          equation <- as.formula(form)
+          form_null <- paste0("Y~X + V + ", 
+                              eq_fact, " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form_null <- gsub("+ +", "+", form_null, 
+                            fixed = TRUE)
+          equation_null <- as.formula(form_null)
+        }
+        else {
+          form <- paste0("Y~X+", eq_fact, 
+                         " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form <- gsub("+ +", "+", form, fixed = TRUE)
+          equation <- as.formula(form)
+        }
+      }
+      else {
+        if (!is.null(V)) {
+          form <- paste0("Y~X+ V + X*V +", eq_fact, 
+                         " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form <- gsub("+ +", "+", form, fixed = TRUE)
+          equation <- as.formula(form)
+          form_null <- paste0("Y~X+ V + ", eq_fact, 
+                              " +", eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form_null <- gsub("+ +", "+", form_null, 
+                            fixed = TRUE)
+          equation_null <- as.formula(form_null)
+        }
+        else {
+          form <- paste0("Y~X+", eq_fact, " +", 
+                         eq_num, "+ s(id,bs=\"re\",by=dummy)")
+          form <- gsub("+ +", "+", form, fixed = TRUE)
+          equation <- as.formula(form)
+        }
+      }
+      fit <- mgcv::gam(formula = equation, data = d)
+      if (!is.null(V)) {
+        fit_null <- mgcv::gam(formula = equation_null, data = d)
+        LRp <- lrtest(fit, fit_null)[2, 5]
+      }
+    }
+    else {
+      if (length(unique(d$X)) > 2) {
+        if (!is.null(V)) {
+          equation <- as.formula(paste0("Y~X + V + X*V + s(id,bs=\"re\",by=dummy)"))
+          fit <- mgcv::gam(formula = equation, data = d)
+          equation_null <- as.formula(paste0("Y~X + V + s(id,bs=\"re\",by=dummy)"))
+          fit_null <- mgcv::gam(formula = equation_null, 
+                                data = d)
+          LRp <- lrtest(fit, fit_null)[2, 5]
+        }
+        else {
+          fit <- mgcv::gam(Y ~ s(X, bs = "cr") + 
+                             s(id, bs = "re", by = dummy), data = d)
+        }
+      }
+      else {
+        if (!is.null(V)) {
+          equation <- as.formula(paste0("Y~X + V + X*V + s(id,bs=\"re\",by=dummy)"))
+          fit <- mgcv::gam(formula = equation, data = d)
+          equation_null <- as.formula(paste0("Y~X + V + s(id,bs=\"re\",by=dummy)"))
+          fit_null <- mgcv::gam(formula = equation_null, 
+                                data = d)
+          LRp <- lrtest(fit, fit_null)[2, 5]
+        }
+        else {
+          fit <- mgcv::gam(Y ~ X + s(id, bs = "re", 
+                                     by = dummy), data = d)
+        }
+      }
+    }
+    if (!is.null(V)) {
+      cat("\nInteraction p-value: ", LRp, "\n")
+      return(list(fit = fit, dat = d, int.p = LRp, covars = Wscreen, 
+                  collinear_vars = collinear_vars))
+    }
+    else {
+      return(list(fit = fit, dat = d, covars = Wscreen, collinear_vars = collinear_vars))
+    }
+  }
+  
+  predict_glm_diff <- function(fit, d, quantile_diff = c(0.25, 0.75), Xvar, Yvar, binaryX = FALSE){
+    
+    res <- summary(fit)
+    res <- res$p.table[2,]
+    res <- data.frame(t(res))
+    
+  lb.diff <- res$Estimate - 1.96 * res$Std..Error
+  ub.diff <- res$Estimate + 1.96 * res$Std..Error
+  res <- data.frame(Y = Yvar, X = Xvar, N = nrow(d), q1 = NA, 
+                    q3 = NA, pred.q1 = NA, pred.q3 = NA, 
+                    point.diff=res$Estimate, lb.diff = lb.diff, ub.diff = ub.diff, Pval = res$Pr...t..)
+  
+  return(list(res = res))
+}
+
+fit_RE_GAM <- function(d, Y, X, W = NULL, id = "clusterid", family = gaussian(), k = 5) {
+  model_vars <- c(Y, X, id, W)
+  dat <- d %>%
+    select(all_of(model_vars)) %>%
+    filter(complete.cases(.)) %>%
+    rename(Y = all_of(Y), X = all_of(X), id = all_of(id))
+  
+  dat$id <- as.factor(dat$id)
+  x_unique <- length(unique(dat$X))
+  smooth_k <- min(k, max(4, x_unique - 1))
+  
+  x_term <- if (x_unique > 4) {
+    paste0("s(X, bs = \"cr\", k = ", smooth_k, ")")
+  } else {
+    "X"
+  }
+  
+  covar_term <- if (!is.null(W) && length(W) > 0) {
+    paste(W, collapse = " + ")
+  } else {
+    NULL
+  }
+  
+  rhs_terms <- c(x_term, covar_term, "s(id, bs = \"re\")")
+  form <- as.formula(paste("Y ~", paste(rhs_terms, collapse = " + ")))
+  fit <- mgcv::gam(form, data = dat, family = family, method = "REML")
+  
+  list(
+    fit = fit,
+    dat = dat,
+    used_smooth = x_unique > 4
+  )
+}
+
+extract_gam_sensitivity <- function(fit_obj, Xvar, Yvar) {
+  fit_summary <- summary(fit_obj$fit)
+  
+  if (isTRUE(fit_obj$used_smooth) && nrow(fit_summary$s.table) > 0) {
+    smooth_stats <- fit_summary$s.table[1, ]
+    data.frame(
+      X = Xvar,
+      Y = Yvar,
+      N = nrow(fit_obj$dat),
+      term_type = "smooth",
+      edf = unname(smooth_stats["edf"]),
+      ref.df = unname(smooth_stats["Ref.df"]),
+      statistic = unname(smooth_stats["F"]),
+      pval = unname(smooth_stats["p-value"])
+    )
+  } else {
+    param_stats <- fit_summary$p.table["X", ]
+    data.frame(
+      X = Xvar,
+      Y = Yvar,
+      N = nrow(fit_obj$dat),
+      term_type = "linear",
+      edf = NA_real_,
+      ref.df = NA_real_,
+      statistic = unname(param_stats["t value"]),
+      pval = unname(param_stats["Pr(>|t|)"])
+    )
+  }
+}
+
+build_gam_curve_data <- function(fit_obj, Xvar, Yvar) {
+  dat <- fit_obj$dat
+  x_seq <- seq(min(dat$X), max(dat$X), length.out = 200)
+  newdat <- dat[rep(1, length(x_seq)), , drop = FALSE]
+  newdat$X <- x_seq
+  newdat$id <- dat$id[1]
+  
+  covars <- setdiff(names(newdat), c("Y", "X", "id"))
+  for (covar in covars) {
+    if (is.numeric(dat[[covar]]) || is.integer(dat[[covar]])) {
+      newdat[[covar]] <- median(dat[[covar]], na.rm = TRUE)
+    } else {
+      mode_value <- names(sort(table(dat[[covar]]), decreasing = TRUE))[1]
+      if (is.factor(dat[[covar]])) {
+        newdat[[covar]] <- factor(mode_value, levels = levels(dat[[covar]]))
+      } else {
+        newdat[[covar]] <- mode_value
+      }
+    }
+  }
+  
+  preds <- predict(
+    fit_obj$fit,
+    newdata = newdat,
+    se.fit = TRUE,
+    exclude = "s(id)"
+  )
+  
+  data.frame(
+    X = x_seq,
+    fit = preds$fit,
+    se = preds$se.fit,
+    lb = preds$fit - 1.96 * preds$se.fit,
+    ub = preds$fit + 1.96 * preds$se.fit,
+    Xvar = Xvar,
+    Yvar = Yvar
+  )
+}
+
+build_gam_reference_data <- function(fit_obj, x_values) {
+  dat <- fit_obj$dat
+  newdat <- dat[rep(1, length(x_values)), , drop = FALSE]
+  newdat$X <- x_values
+  newdat$id <- dat$id[1]
+  
+  covars <- setdiff(names(newdat), c("Y", "X", "id"))
+  for (covar in covars) {
+    if (is.numeric(dat[[covar]]) || is.integer(dat[[covar]])) {
+      newdat[[covar]] <- median(dat[[covar]], na.rm = TRUE)
+    } else {
+      mode_value <- names(sort(table(dat[[covar]]), decreasing = TRUE))[1]
+      if (is.factor(dat[[covar]])) {
+        newdat[[covar]] <- factor(mode_value, levels = levels(dat[[covar]]))
+      } else {
+        newdat[[covar]] <- mode_value
+      }
+    }
+  }
+  
+  newdat
+}
+
+extract_gam_percentile_contrast <- function(fit_obj, Xvar, Yvar, probs = c(0.10, 0.90)) {
+  dat <- fit_obj$dat
+  q_vals <- as.numeric(stats::quantile(dat$X, probs = probs, na.rm = TRUE, names = FALSE))
+  newdat <- build_gam_reference_data(fit_obj, x_values = q_vals)
+  
+  pred_fit <- predict(fit_obj$fit, newdata = newdat, type = "response")
+  Xp <- predict(fit_obj$fit, newdata = newdat, type = "lpmatrix")
+  re_cols <- grepl("^s\\(id\\)", colnames(Xp))
+  if (any(re_cols)) {
+    Xp[, re_cols] <- 0
+  }
+  
+  diff_vec <- Xp[2, ] - Xp[1, ]
+  vc <- stats::vcov(fit_obj$fit)
+  diff_est <- as.numeric(pred_fit[2] - pred_fit[1])
+  diff_se <- sqrt(as.numeric(diff_vec %*% vc %*% diff_vec))
+  
+  data.frame(
+    X = Xvar,
+    Y = Yvar,
+    N = nrow(dat),
+    q10 = q_vals[1],
+    q90 = q_vals[2],
+    pred_q10 = as.numeric(pred_fit[1]),
+    pred_q90 = as.numeric(pred_fit[2]),
+    point_diff = diff_est,
+    lb_diff = diff_est - 1.96 * diff_se,
+    ub_diff = diff_est + 1.96 * diff_se,
+    pval_diff = 2 * stats::pnorm(abs(diff_est / diff_se), lower.tail = FALSE)
+  )
+}
+
+```
+
+Analysis + Plotting code 
+
+```{r}
+
+#subset data to only what is needed
+
+d <- d %>%
+  select(logFER_inf, hemo_eeel, hepcidin_eeel, logsTFR_inf, logRBP_inf, logB12, logfolate, clusterid, TS_t3_Z, sex, age, birthord, momage, momheight, momedu, hfiacat, Nlt18, Ncomp, watmin, walls, floor, HHwealth_scaled, tr, life_viol_any_t3_cat, viol_any_preg_cat)
+
+Xvars <- c(
+  "logFER_inf",
+  "hemo_eeel",
+  "hepcidin_eeel",
+  "logsTFR_inf",
+  "logRBP_inf",
+  "logB12",
+  "logfolate"
+)       
+
+Yvars <- "TS_t3_Z"
+
+#Set list of adjustment variables
+
+Wvars <- c(
+  "sex", "age", "birthord", "momage", "momheight", "momedu",
+  "hfiacat", "Nlt18", "Ncomp", "watmin", "HHwealth_scaled",
+  "tr", "life_viol_any_t3_cat", "viol_any_preg_cat"
+)
+
+res_unadj <- NULL
+for(i in Xvars){
+  for(j in Yvars){
+    print(i)
+    temp <- fit_washb_glm(d=d, Y=j, X=i, W=NULL)
+    temp$X <- i
+    temp$Y <- j
+    print(temp)
+    res_unadj <- bind_rows(res_unadj, temp)
+  }}
+
+res_adj <- NULL
+for(i in Xvars){
+  for(j in Yvars){
+    print(i)
+    temp <- fit_washb_glm(d=d, Y=j, X=i, W=Wvars)
+    temp$X <- i
+    temp$Y <- j
+    print(temp)
+    res_adj <- bind_rows(res_adj, temp)
+  }}
+
+
+#Create new variable names!
+
+figure_names <- c(
+  logFER_inf = "Ferritin (\u00b5g/L)",
+  hemo_eeel = "Hemoglobin (g/dL)",
+  hepcidin_eeel = "Hepcidin (ng/mL)",
+  logsTFR_inf = "sTfR (mg/L)",
+  logRBP_inf = "RBP (\u00b5mol/L)",
+  logB12 = "Vitamin B12 (pmol/L)",
+  logfolate = "Folate (nmol/L)",
+  TS_t3_Z = "Telomere length z-score"
+)
+
+# Create new variable names
+figure_names <- c(
+  logFER_inf = "Ferritin (\u00b5g/L)",
+  hemo_eeel = "Hemoglobin (g/dL)",
+  hepcidin_eeel = "Hepcidin (ng/mL)",
+  logsTFR_inf = "sTfR (mg/L)",
+  logRBP_inf = "RBP (\u00b5mol/L)",
+  logB12 = "Vitamin B12 (pmol/L)",
+  logfolate = "Folate (nmol/L)",
+  TS_t3_Z = "Telomere length z-score"
+)
+
+# Make plotting copies so you do not overwrite originals
+res_unadj_plot <- res_unadj %>%
+  mutate(
+    X = ifelse(X %in% names(figure_names), figure_names[X], X),
+    Y = ifelse(Y %in% names(figure_names), figure_names[Y], Y)
+  )
+
+res_adj_plot <- res_adj %>%
+  mutate(
+    X = ifelse(X %in% names(figure_names), figure_names[X], X),
+    Y = ifelse(Y %in% names(figure_names), figure_names[Y], Y)
+  )
+
+p_unadj <- ggplot(res_unadj_plot, aes(x = X, y = coef)) +
+  geom_point(size = 3, color = analysis_palette["primary"]) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.75, linewidth = 1, color = analysis_palette["primary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  facet_wrap(~Y, ncol = 2, scales = "free") +
+  coord_flip() +
+  labs(y = "Mean difference", x = "Micronutrient biomarkers") +
+  ggtitle("") +
+  theme_analysis_plot() +
+  theme(
+    axis.ticks.x = element_blank(),
+    legend.position = "none",
+    strip.text = element_text(vjust = 1),
+    axis.text.y = ggtext::element_markdown(),
+    panel.spacing = unit(1, "lines")
+  )
+
+p_adj <- ggplot(res_adj_plot, aes(x = X, y = coef)) +
+  geom_point(size = 3, color = analysis_palette["primary"]) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.75, linewidth = 1, color = analysis_palette["primary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  facet_wrap(~Y, ncol = 2, scales = "free") +
+  coord_flip() +
+  labs(y = "Adjusted mean difference", x = "Micronutrient biomarkers") +
+  ggtitle("") +
+  theme_analysis_plot() +
+  theme(
+    axis.ticks.x = element_blank(),
+    legend.position = "none",
+    strip.text = element_text(vjust = 1),
+    axis.text.y = ggtext::element_markdown(),
+    panel.spacing = unit(1, "lines")
+  )
+
+write.csv(res_unadj, here("results/H1Aunadj_results.csv"))
+write.csv(res_adj, here("results/H1Aadj_results.csv"))
+
+
+ggsave(here("results/H1Aforest_plot_unadj.png"), p_unadj, width=5, height=5, dpi=600)
+ggsave(here("results/H1Aforest_plot_adj.png"), p_adj, width=5, height=5, dpi=600)
+```
+
+```{r}
+# Create folders to save plots
+dir.create(here("results/H1Ascatterplots_unadj"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("results/H1Ascatterplots_adj"), recursive = TRUE, showWarnings = FALSE)
+
+adjusted_plot_list <- list()
+
+for(i in Xvars){
+  for(j in Yvars){
+    
+    # Data for this X/Y pair
+    df_plot <- d %>%
+      select(all_of(c(i, j, Wvars))) %>%
+      filter(!is.na(.data[[i]]), !is.na(.data[[j]]))
+    
+# -------------------
+# Unadjusted plot
+# -------------------
+    p_unadj <- ggplot(df_plot, aes(x = .data[[i]], y = .data[[j]])) +
+      geom_point(alpha = 0.35, color = analysis_palette["neutral"]) +
+      geom_smooth(method = "lm", se = TRUE, color = analysis_palette["primary"], fill = analysis_palette["fill"]) +
+      theme_analysis_plot() +
+      labs(
+        title = paste(figure_names[j], "vs", figure_names[i]),
+        x = figure_names[i],
+        y = figure_names[j]
+      ) +
+      theme(legend.position = "none")
+    
+    ggsave(
+      here("results/H1Ascatterplots_unadj", paste0("unadj_", j, "_", i, ".png")),
+      p_unadj, width = 5, height = 4, dpi = 600
+    )
+    
+# -------------------
+# Adjusted plot
+# -------------------
+    df_adj <- df_plot %>% filter(complete.cases(.))
+    
+    form_adj <- as.formula(
+      paste(j, "~", i, "+", paste(Wvars, collapse = " + "))
+    )
+    fit_adj <- lm(form_adj, data = df_adj)
+    
+    newdat <- data.frame(seq(min(df_adj[[i]], na.rm = TRUE),
+                             max(df_adj[[i]], na.rm = TRUE),
+                             length.out = 100))
+    names(newdat) <- i
+    
+    for(w in Wvars){
+      if(is.numeric(df_adj[[w]]) || is.integer(df_adj[[w]])){
+        newdat[[w]] <- mean(df_adj[[w]], na.rm = TRUE)
+      } else {
+        newdat[[w]] <- names(sort(table(df_adj[[w]]), decreasing = TRUE))[1]
+      }
+    }
+    
+    newdat$pred <- predict(fit_adj, newdata = newdat)
+    
+    p_adj <- ggplot(df_adj, aes(x = .data[[i]], y = .data[[j]])) +
+      geom_point(alpha = 0.35, color = analysis_palette["neutral"]) +
+      geom_line(data = newdat, aes(x = .data[[i]], y = pred), linewidth = 1, color = analysis_palette["primary"]) +
+      theme_analysis_plot() +
+      labs(
+        title = paste(figure_names[j], "vs", figure_names[i]),
+        x = figure_names[i],
+        y = figure_names[j]
+      ) +
+      theme(legend.position = "none")
+
+    adjusted_plot_list[[i]] <- p_adj
+    
+    ggsave(
+      here("results/H1Ascatterplots_adj", paste0("adj_", j, "_", i, ".png")),
+      p_adj, width = 5, height = 4, dpi = 600
+    )
+  }
+}
+
+p_adj_combined <- cowplot::plot_grid(
+  plotlist = adjusted_plot_list,
+  labels = LETTERS[seq_along(adjusted_plot_list)],
+  label_size = 12,
+  label_fontface = "bold",
+  ncol = 2,
+  align = "hv"
+)
+
+ggsave(
+  here("results", "H1A Final", "H1A_scatterplots_adj_combined.png"),
+  p_adj_combined,
+  width = 10,
+  height = 14,
+  dpi = 600
+)
+```
+
+```{r}
+# H1A sensitivity analysis: random-effects GAM with smooth micronutrient terms
+dir.create(here("results", "H1A Final", "sensitivity"), recursive = TRUE, showWarnings = FALSE)
+
+h1a_gam_unadj <- NULL
+h1a_gam_adj <- NULL
+h1a_gam_curves <- NULL
+h1a_gam_pct_contrasts <- NULL
+
+for (i in Xvars) {
+  for (j in Yvars) {
+    fit_unadj <- fit_RE_GAM(d = d, Y = j, X = i, W = NULL)
+    fit_adj <- fit_RE_GAM(d = d, Y = j, X = i, W = Wvars)
+    
+    h1a_gam_unadj <- bind_rows(
+      h1a_gam_unadj,
+      extract_gam_sensitivity(fit_unadj, Xvar = i, Yvar = j) %>%
+        mutate(model = "unadjusted")
+    )
+    
+    h1a_gam_adj <- bind_rows(
+      h1a_gam_adj,
+      extract_gam_sensitivity(fit_adj, Xvar = i, Yvar = j) %>%
+        mutate(model = "adjusted")
+    )
+    
+    curve_unadj <- build_gam_curve_data(fit_unadj, Xvar = i, Yvar = j) %>%
+      mutate(model = "unadjusted")
+    curve_adj <- build_gam_curve_data(fit_adj, Xvar = i, Yvar = j) %>%
+      mutate(model = "adjusted")
+    
+    pct_unadj <- extract_gam_percentile_contrast(fit_unadj, Xvar = i, Yvar = j) %>%
+      mutate(model = "unadjusted")
+    pct_adj <- extract_gam_percentile_contrast(fit_adj, Xvar = i, Yvar = j) %>%
+      mutate(model = "adjusted")
+    
+    h1a_gam_curves <- bind_rows(h1a_gam_curves, curve_unadj, curve_adj)
+    h1a_gam_pct_contrasts <- bind_rows(h1a_gam_pct_contrasts, pct_unadj, pct_adj)
+    
+    plot_curves <- bind_rows(curve_unadj, curve_adj) %>%
+      mutate(
+        model = factor(model, levels = c("unadjusted", "adjusted")),
+        X_label = figure_names[i],
+        Y_label = figure_names[j]
+      )
+    
+    p_gam <- ggplot(plot_curves, aes(x = X, y = fit, color = model, fill = model)) +
+      geom_ribbon(aes(ymin = lb, ymax = ub), alpha = 0.15, color = NA) +
+      geom_line(linewidth = 1) +
+      facet_wrap(~model, ncol = 1) +
+      scale_color_manual(values = c(unadjusted = analysis_palette["primary"], adjusted = analysis_palette["secondary"])) +
+      scale_fill_manual(values = c(unadjusted = analysis_palette["fill"], adjusted = "#FDD0A2")) +
+      theme_analysis_plot() +
+      labs(
+        title = paste0("RE-GAM sensitivity: ", figure_names[j], " vs ", figure_names[i]),
+        x = figure_names[i],
+        y = figure_names[j],
+        color = NULL,
+        fill = NULL
+      ) +
+      theme(legend.position = "none")
+    
+    ggsave(
+      here("results", "H1A Final", "sensitivity", paste0("H1A_RE_GAM_", j, "_", i, ".png")),
+      p_gam,
+      width = 5,
+      height = 6,
+      dpi = 600
+    )
+  }
+}
+
+h1a_gam_sensitivity <- bind_rows(h1a_gam_unadj, h1a_gam_adj) %>%
+  mutate(
+    X_label = figure_names[X],
+    Y_label = figure_names[Y]
+  ) %>%
+  select(model, X, X_label, Y, Y_label, N, term_type, edf, ref.df, statistic, pval)
+
+h1a_gam_pct_contrasts <- h1a_gam_pct_contrasts %>%
+  mutate(
+    X_label = figure_names[X],
+    Y_label = figure_names[Y],
+    contrast = "P90 vs P10"
+  ) %>%
+  select(model, contrast, X, X_label, Y, Y_label, N, q10, q90, pred_q10, pred_q90, point_diff, lb_diff, ub_diff, pval_diff)
+
+write.csv(
+  h1a_gam_sensitivity,
+  here("results", "H1A Final", "sensitivity", "H1A_RE_GAM_sensitivity.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  h1a_gam_pct_contrasts,
+  here("results", "H1A Final", "sensitivity", "H1A_RE_GAM_percentile_contrasts.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  h1a_gam_curves,
+  here("figure-data", "H1A_RE_GAM_curve_data.RDS")
+)
+
+saveRDS(
+  h1a_gam_pct_contrasts,
+  here("figure-data", "H1A_RE_GAM_percentile_contrasts.RDS")
+)
+
+h1a_gam_pct_plot <- h1a_gam_pct_contrasts %>%
+  filter(model == "adjusted") %>%
+  mutate(
+    X_label = factor(X_label, levels = sort(unique(X_label)))
+  ) %>%
+  ggplot(aes(x = X_label, y = point_diff)) +
+  geom_point(size = 3, color = analysis_palette["secondary"]) +
+  geom_errorbar(aes(ymin = lb_diff, ymax = ub_diff), width = 0.5, linewidth = 1, color = analysis_palette["secondary"]) +
+  geom_hline(yintercept = 0, color = analysis_palette["neutral"], linetype = "dashed") +
+  coord_flip() +
+  theme_analysis_plot() +
+  labs(
+    title = "H1A sensitivity analysis",
+    subtitle = "Adjusted predicted difference in telomere length z-score: 90th vs 10th percentile",
+    x = "Micronutrient biomarker",
+    y = "Adjusted mean difference in telomere length z-score"
+  ) +
+  theme(legend.position = "none")
+
+ggsave(
+  here("results", "H1A Final", "sensitivity", "H1A_RE_GAM_percentile_contrast_plot.png"),
+  h1a_gam_pct_plot,
+  width = 7,
+  height = 5,
+  dpi = 600
+)
+
+h1a_gam_pct_contrasts
+```
